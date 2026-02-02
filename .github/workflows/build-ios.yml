@@ -1,0 +1,131 @@
+name: Build RustDesk iOS
+
+on:
+  workflow_dispatch:
+    inputs:
+      upload-artifact:
+        description: '是否上传 artifact 和发布 release'
+        type: boolean
+        default: true
+      upload-tag:
+        description: 'Release tag name'
+        type: string
+        default: "nightly"
+
+env:
+  FLUTTER_VERSION: "3.24.5"
+  RUST_VERSION: "1.75"
+  VCPKG_COMMIT_ID: "120deac3062162151622ca4860575a33844ba10b"
+  VERSION: "1.4.5"
+  TAG_NAME: "${{ inputs.upload-tag }}"
+  UPLOAD_ARTIFACT: "${{ inputs.upload-artifact }}"
+
+jobs:
+  generate-bridge:
+    uses: ./.github/workflows/bridge.yml
+
+  build-rustdesk-ios:
+    name: Build RustDesk iOS IPA
+    runs-on: macos-latest
+    needs: [generate-bridge]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: aarch64
+            target: aarch64-apple-ios
+            vcpkg-triplet: arm64-ios
+
+    steps:
+      - name: Export GitHub Actions cache environment variables
+        uses: actions/github-script@v6
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
+      - name: Install dependencies
+        run: |
+          brew install nasm yasm
+
+      - name: Checkout source code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: "stable"
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+
+      - name: Patch Flutter (dropdown menu filter)
+        run: |
+          cd $(dirname $(dirname $(which flutter)))
+          [[ "3.24.5" == ${{ env.FLUTTER_VERSION }} ]] && git apply ${{ github.workspace }}/.github/patches/flutter_3.24.4_dropdown_menu_enableFilter.diff
+
+      - name: Setup vcpkg
+        uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgGitCommitId: ${{ env.VCPKG_COMMIT_ID }}
+          doNotCache: false
+
+      - name: Install vcpkg dependencies
+        run: |
+          if ! $VCPKG_ROOT/vcpkg install \
+            --triplet ${{ matrix.vcpkg-triplet }} \
+            --x-install-root="$VCPKG_ROOT/installed"; then
+            find "${VCPKG_ROOT}/" -name "*.log" | while read -r log; do
+              echo "$log:"
+              cat "$log"
+            done
+            exit 1
+          fi
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          targets: ${{ matrix.target }}
+          components: rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: rustdesk-lib-cache-ios
+          key: ${{ matrix.target }}
+
+      - name: Restore bridge files
+        uses: actions/download-artifact@master
+        with:
+          name: bridge-artifact
+          path: ./
+
+      - name: Build librustdesk.a
+        run: |
+          rustup target add ${{ matrix.target }}
+          cargo build --features flutter,hwcodec --release --target ${{ matrix.target }} --lib
+
+      - name: Copy librustdesk.a to Flutter
+        run: |
+          mkdir -p flutter/ios/Runner
+          cp target/${{ matrix.target }}/release/liblibrustdesk.a flutter/ios/Runner/
+
+      - name: Build IPA (no codesign)
+        run: |
+          cd flutter
+          flutter build ipa --release --no-codesign
+
+      - name: Upload IPA artifact
+        if: ${{ inputs.upload-artifact }}
+        uses: actions/upload-artifact@master
+        with:
+          name: rustdesk-${{ env.VERSION }}-ios.ipa
+          path: flutter/build/ios/ipa/*.ipa
+
+      - name: Publish IPA to Release
+        if: ${{ inputs.upload-artifact }}
+        uses: softprops/action-gh-release@v1
+        with:
+          prerelease: true
+          tag_name: ${{ env.TAG_NAME }}
+          files: flutter/build/ios/ipa/*.ipa
